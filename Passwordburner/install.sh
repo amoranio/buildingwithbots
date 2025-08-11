@@ -14,7 +14,7 @@ done
 
 # ===== Constants =====
 APP_USER="pwburner"
-APP_GROUP="pwburner"
+APP_GROUP=""                         # will default to APP_USER after creation
 APP_DIR="/srv/pwburner"
 APP_CODE_DIR="$APP_DIR/app"
 APP_STATIC_DIR="$APP_DIR/static"
@@ -34,13 +34,8 @@ is_debian_like() {
     *) return 1 ;;
   esac
 }
-has_systemd() {
-  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
-}
-in_container() {
-  # crude but effective: no systemd PID1 or cgroup hints
-  ! has_systemd || grep -qiE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
-}
+has_systemd() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
+in_container() { ! has_systemd || grep -qiE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null; }
 
 # ===== OS check =====
 echo "[0/10] OS check..."
@@ -70,12 +65,23 @@ if (( PYMAJOR < 3 || (PYMAJOR == 3 && PYMINOR < 10) )); then
   exit 1
 fi
 
-# ===== System user & dirs =====
+# ===== System user & dirs (robust on minimal Debian 13) =====
 echo "[3/10] Creating user and directories..."
-getent group "$APP_GROUP" >/dev/null || groupadd --force "$APP_GROUP"
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
-  useradd -r -g "$APP_GROUP" -s /usr/sbin/nologin "$APP_USER"
+  if command -v adduser >/dev/null 2>&1; then
+    adduser --system --group --home "$APP_DIR" "$APP_USER"
+  else
+    # Ensure shadow tools exist, then create user and its group (-U)
+    apt-get install -y -qq passwd adduser || true
+    if command -v adduser >/dev/null 2>&1; then
+      adduser --system --group --home "$APP_DIR" "$APP_USER"
+    else
+      useradd -r -m -d "$APP_DIR" -s /usr/sbin/nologin -U "$APP_USER"
+    fi
+  fi
 fi
+APP_GROUP="${APP_GROUP:-$APP_USER}"
+
 mkdir -p "$APP_CODE_DIR" "$APP_STATIC_DIR" "$ENV_DIR"
 chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
 chmod 750 "$APP_DIR" "$APP_CODE_DIR" "$APP_STATIC_DIR"
@@ -414,6 +420,9 @@ fi
 
 # ===== Nginx (and TLS) =====
 echo "[8/10] Configuring Nginx..."
+# Avoid default-site server_name '_' conflict on Debian
+rm -f /etc/nginx/sites-enabled/default || true
+
 cat > "$NGINX_SITE" <<NGINX
 server {
     listen 80;
@@ -434,6 +443,8 @@ ln -sf "$NGINX_SITE" "$NGINX_LINK"
 nginx -t
 if has_systemd && ! in_container; then
   systemctl reload nginx || true
+else
+  echo "-> In container/no systemd: start Nginx manually if needed: nginx"
 fi
 
 if [[ -n "$DOMAIN" ]] && has_systemd && ! in_container; then
@@ -444,7 +455,7 @@ if [[ -n "$DOMAIN" ]] && has_systemd && ! in_container; then
     certbot --nginx -d "$DOMAIN" --redirect --agree-tos --register-unsafely-without-email || true
   fi
 else
-  [[ -n "$DOMAIN" ]] && echo "-> Skipped certbot (container/no systemd)."
+  [[ -n "$DOMAIN" ]] && echo "-> Skipped certbot (container or no systemd)."
 fi
 
 # ===== Firewall =====
