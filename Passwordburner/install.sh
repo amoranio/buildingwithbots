@@ -14,6 +14,7 @@ done
 
 # ===== Constants =====
 APP_USER="pwburner"
+APP_GROUP="pwburner"
 APP_DIR="/srv/pwburner"
 APP_CODE_DIR="$APP_DIR/app"
 APP_STATIC_DIR="$APP_DIR/static"
@@ -24,19 +25,32 @@ SYSTEMD_UNIT="/etc/systemd/system/pwburner.service"
 NGINX_SITE="/etc/nginx/sites-available/pwburner"
 NGINX_LINK="/etc/nginx/sites-enabled/pwburner"
 
-echo "[0/9] OS check..."
-if [[ -r /etc/os-release ]]; then
+# ===== Helpers =====
+is_debian_like() {
+  [[ -r /etc/os-release ]] || return 1
   . /etc/os-release
   case "${ID_LIKE:-$ID}" in
-    *debian*|debian|ubuntu) : ;;
-    *) echo "This script targets Debian/Ubuntu. Detected: ${NAME:-unknown}. Aborting."; exit 1 ;;
+    *debian*|debian|ubuntu) return 0 ;;
+    *) return 1 ;;
   esac
-else
-  echo "Cannot detect OS (no /etc/os-release). Aborting."
+}
+has_systemd() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+in_container() {
+  # crude but effective: no systemd PID1 or cgroup hints
+  ! has_systemd || grep -qiE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
+}
+
+# ===== OS check =====
+echo "[0/10] OS check..."
+if ! is_debian_like; then
+  echo "This installer targets Debian/Ubuntu. Aborting."
   exit 1
 fi
 
-echo "[1/9] Install packages (Debian/Ubuntu)..."
+# ===== Install packages =====
+echo "[1/10] Installing packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y --no-install-recommends \
@@ -47,22 +61,28 @@ if [[ -n "$DOMAIN" ]]; then
   apt-get install -y --no-install-recommends certbot python3-certbot-nginx
 fi
 
-echo "[2/9] Check Python version..."
+# ===== Python version check =====
+echo "[2/10] Checking Python version..."
 PYV=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 PYMAJOR=${PYV%%.*}; PYMINOR=${PYV#*.}
 if (( PYMAJOR < 3 || (PYMAJOR == 3 && PYMINOR < 10) )); then
-  echo "Python 3.10+ required. Found $PYV. Aborting."
+  echo "Python 3.10+ required (found $PYV). Aborting."
   exit 1
 fi
 
-echo "[3/9] Create user and dirs..."
-id -u "$APP_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$APP_USER"
+# ===== System user & dirs =====
+echo "[3/10] Creating user and directories..."
+getent group "$APP_GROUP" >/dev/null || groupadd --force "$APP_GROUP"
+if ! id -u "$APP_USER" >/dev/null 2>&1; then
+  useradd -r -g "$APP_GROUP" -s /usr/sbin/nologin "$APP_USER"
+fi
 mkdir -p "$APP_CODE_DIR" "$APP_STATIC_DIR" "$ENV_DIR"
-chown -R "$APP_USER":""$APP_USER" "$APP_DIR"
+chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
 chmod 750 "$APP_DIR" "$APP_CODE_DIR" "$APP_STATIC_DIR"
 chmod 750 "$ENV_DIR"
 
-echo "[4/9] Python venv + deps..."
+# ===== Python venv + deps =====
+echo "[4/10] Creating venv and installing deps..."
 python3 -m venv "$APP_VENV"
 # shellcheck disable=SC1091
 source "$APP_VENV/bin/activate"
@@ -74,7 +94,8 @@ pydantic==2.8.2
 REQS
 pip install -r "$APP_DIR/requirements.txt"
 
-echo "[5/9] Application code..."
+# ===== Application code =====
+echo "[5/10] Writing application code..."
 # ----- app.py -----
 cat > "$APP_CODE_DIR/app.py" <<'PY'
 import base64, hashlib, hmac, json, os, secrets, sqlite3, time
@@ -340,14 +361,15 @@ button{margin-top:1rem;padding:.6rem 1rem;cursor:pointer}.hint{color:#444}.error
 pre{background:#f6f6f6;padding:1rem;overflow:auto}
 CSS
 
-chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
 
-echo "[6/9] Secrets & environment..."
+# ===== Secrets / env =====
+echo "[6/10] Generating secrets & environment..."
 if [[ ! -f "$ENV_FILE" ]]; then
+  umask 077
   SERVER_HMAC_SECRET="$(openssl rand -base64 32)"
   LOG_SALT="$(openssl rand -base64 32)"
   ADMIN_TOKEN="$(openssl rand -hex 24)"
-  umask 077
   cat > "$ENV_FILE" <<ENV
 PWB_DATA_DIR=$APP_CODE_DIR
 PWB_STATIC_DIR=$APP_STATIC_DIR
@@ -362,7 +384,8 @@ ENV
   chmod 600 "$ENV_FILE"
 fi
 
-echo "[7/9] systemd service..."
+# ===== systemd unit =====
+echo "[7/10] Configuring systemd service..."
 cat > "$SYSTEMD_UNIT" <<SYSTEMD
 [Unit]
 Description=Password Burner (FastAPI)
@@ -370,7 +393,7 @@ After=network.target
 
 [Service]
 User=$APP_USER
-Group=$APP_USER
+Group=$APP_GROUP
 EnvironmentFile=$ENV_FILE
 WorkingDirectory=$APP_DIR
 ExecStart=$APP_VENV/bin/uvicorn app.app:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips="*" --access-log off
@@ -380,10 +403,17 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
-systemctl daemon-reload
-systemctl enable --now pwburner
 
-echo "[8/9] Nginx..."
+if has_systemd && ! in_container; then
+  systemctl daemon-reload
+  systemctl enable --now pwburner
+else
+  echo "-> Skipping systemd start (container or no systemd). To run manually:"
+  echo "   $APP_VENV/bin/uvicorn app.app:app --host 0.0.0.0 --port 8000"
+fi
+
+# ===== Nginx (and TLS) =====
+echo "[8/10] Configuring Nginx..."
 cat > "$NGINX_SITE" <<NGINX
 server {
     listen 80;
@@ -399,29 +429,41 @@ server {
     # Certbot will insert HTTPS redirect if --domain is used
 }
 NGINX
-ln -sf "$NGINX_SITE" "$NGINX_LINK"
-nginx -t && systemctl reload nginx
 
-if [[ -n "$DOMAIN" ]]; then
-  echo "[8b/9] Let's Encrypt..."
-  if [[ -z "$EMAIL" ]]; then
-    certbot --nginx -d "$DOMAIN" --redirect --agree-tos --register-unsafely-without-email || true
-  else
+ln -sf "$NGINX_SITE" "$NGINX_LINK"
+nginx -t
+if has_systemd && ! in_container; then
+  systemctl reload nginx || true
+fi
+
+if [[ -n "$DOMAIN" ]] && has_systemd && ! in_container; then
+  echo "[8b/10] Requesting Let's Encrypt certificate for $DOMAIN..."
+  if [[ -n "$EMAIL" ]]; then
     certbot --nginx -d "$DOMAIN" --redirect --agree-tos -m "$EMAIL" --no-eff-email || true
+  else
+    certbot --nginx -d "$DOMAIN" --redirect --agree-tos --register-unsafely-without-email || true
+  fi
+else
+  [[ -n "$DOMAIN" ]] && echo "-> Skipped certbot (container/no systemd)."
+fi
+
+# ===== Firewall =====
+echo "[9/10] Configuring UFW..."
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow OpenSSH || true
+  ufw allow 'Nginx Full' || true
+  if has_systemd && ! in_container; then
+    yes | ufw enable || true
+  else
+    echo "-> Skipping 'ufw enable' (container/no systemd)."
   fi
 fi
 
-echo "[9/9] Firewall (ufw)..."
-ufw allow OpenSSH || true
-ufw allow 'Nginx Full' || true
-yes | ufw enable || true
-
-echo
-echo "✅ Install complete."
+echo "[10/10] Done."
 if [[ -n "$DOMAIN" ]]; then
   echo "Open: https://${DOMAIN}/"
 else
-  ip=$(hostname -I | awk '{print $1}')
-  echo "Open: http://${ip}/  (Consider adding a domain + TLS later.)"
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo "Open: http://${ip:-127.0.0.1}/  (Consider adding a domain + TLS later.)"
 fi
 echo "Admin audit export token is in $ENV_FILE (ADMIN_TOKEN)."
