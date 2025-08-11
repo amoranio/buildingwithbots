@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Make sure admin binaries are reachable even on minimal images
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
 # ===== Args =====
 DOMAIN=""
 EMAIL=""
@@ -14,7 +17,7 @@ done
 
 # ===== Constants =====
 APP_USER="pwburner"
-APP_GROUP=""                         # will default to APP_USER after creation
+APP_GROUP=""                         # defaults to APP_USER after creation
 APP_DIR="/srv/pwburner"
 APP_CODE_DIR="$APP_DIR/app"
 APP_STATIC_DIR="$APP_DIR/static"
@@ -51,7 +54,8 @@ apt-get update -y
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg lsb-release \
   python3 python3-venv python3-pip sqlite3 \
-  nginx ufw openssl
+  nginx ufw openssl \
+  passwd adduser
 if [[ -n "$DOMAIN" ]]; then
   apt-get install -y --no-install-recommends certbot python3-certbot-nginx
 fi
@@ -65,19 +69,19 @@ if (( PYMAJOR < 3 || (PYMAJOR == 3 && PYMINOR < 10) )); then
   exit 1
 fi
 
-# ===== System user & dirs (robust on minimal Debian 13) =====
+# ===== System user & dirs (Debian 12/13 safe) =====
 echo "[3/10] Creating user and directories..."
+ADDUSER="/usr/sbin/adduser"
+USERADD="/usr/sbin/useradd"
+
 if ! id -u "$APP_USER" >/dev/null 2>&1; then
-  if command -v adduser >/dev/null 2>&1; then
-    adduser --system --group --home "$APP_DIR" "$APP_USER"
+  if [[ -x "$ADDUSER" ]]; then
+    "$ADDUSER" --system --group --home "$APP_DIR" "$APP_USER"
+  elif [[ -x "$USERADD" ]]; then
+    "$USERADD" -r -m -d "$APP_DIR" -s /usr/sbin/nologin -U "$APP_USER"
   else
-    # Ensure shadow tools exist, then create user and its group (-U)
-    apt-get install -y -qq passwd adduser || true
-    if command -v adduser >/dev/null 2>&1; then
-      adduser --system --group --home "$APP_DIR" "$APP_USER"
-    else
-      useradd -r -m -d "$APP_DIR" -s /usr/sbin/nologin -U "$APP_USER"
-    fi
+    echo "Neither adduser nor useradd is available even after package install. Aborting."
+    exit 1
   fi
 fi
 APP_GROUP="${APP_GROUP:-$APP_USER}"
