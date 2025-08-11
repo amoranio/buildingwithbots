@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- args ---
-DOMAIN=""         # e.g. secrets.example.com
-EMAIL=""          # Let's Encrypt email
+# ===== Args =====
+DOMAIN=""
+EMAIL=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain) DOMAIN="$2"; shift 2 ;;
@@ -12,38 +12,57 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- constants ---
+# ===== Constants =====
 APP_USER="pwburner"
 APP_DIR="/srv/pwburner"
 APP_CODE_DIR="$APP_DIR/app"
 APP_STATIC_DIR="$APP_DIR/static"
 APP_VENV="$APP_DIR/venv"
-APP_DB_DIR="$APP_CODE_DIR"
 ENV_DIR="/etc/pwburner"
 ENV_FILE="$ENV_DIR/pwb.env"
 SYSTEMD_UNIT="/etc/systemd/system/pwburner.service"
 NGINX_SITE="/etc/nginx/sites-available/pwburner"
 NGINX_LINK="/etc/nginx/sites-enabled/pwburner"
 
-echo "[1/8] Installing OS packages..."
+echo "[0/9] OS check..."
+if [[ -r /etc/os-release ]]; then
+  . /etc/os-release
+  case "${ID_LIKE:-$ID}" in
+    *debian*|debian|ubuntu) : ;;
+    *) echo "This script targets Debian/Ubuntu. Detected: ${NAME:-unknown}. Aborting."; exit 1 ;;
+  esac
+else
+  echo "Cannot detect OS (no /etc/os-release). Aborting."
+  exit 1
+fi
+
+echo "[1/9] Install packages (Debian/Ubuntu)..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg lsb-release \
-  python3.12-venv python3-pip sqlite3 \
-  nginx ufw
+  python3 python3-venv python3-pip sqlite3 \
+  nginx ufw openssl
 if [[ -n "$DOMAIN" ]]; then
   apt-get install -y --no-install-recommends certbot python3-certbot-nginx
 fi
 
-echo "[2/8] Creating user and directories..."
+echo "[2/9] Check Python version..."
+PYV=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PYMAJOR=${PYV%%.*}; PYMINOR=${PYV#*.}
+if (( PYMAJOR < 3 || (PYMAJOR == 3 && PYMINOR < 10) )); then
+  echo "Python 3.10+ required. Found $PYV. Aborting."
+  exit 1
+fi
+
+echo "[3/9] Create user and dirs..."
 id -u "$APP_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin "$APP_USER"
 mkdir -p "$APP_CODE_DIR" "$APP_STATIC_DIR" "$ENV_DIR"
-chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+chown -R "$APP_USER":""$APP_USER" "$APP_DIR"
 chmod 750 "$APP_DIR" "$APP_CODE_DIR" "$APP_STATIC_DIR"
 chmod 750 "$ENV_DIR"
 
-echo "[3/8] Python venv + deps..."
+echo "[4/9] Python venv + deps..."
 python3 -m venv "$APP_VENV"
 # shellcheck disable=SC1091
 source "$APP_VENV/bin/activate"
@@ -55,8 +74,8 @@ pydantic==2.8.2
 REQS
 pip install -r "$APP_DIR/requirements.txt"
 
-echo "[4/8] App code..."
-# ---------- app.py ----------
+echo "[5/9] Application code..."
+# ----- app.py -----
 cat > "$APP_CODE_DIR/app.py" <<'PY'
 import base64, hashlib, hmac, json, os, secrets, sqlite3, time
 from pathlib import Path
@@ -65,29 +84,27 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-# Config
 DATA_DIR   = Path(os.getenv("PWB_DATA_DIR", "/srv/pwburner/app"))
 STATIC_DIR = Path(os.getenv("PWB_STATIC_DIR", "/srv/pwburner/static"))
 DB_PATH    = DATA_DIR / "data.db"
 
-DEFAULT_TTL = int(os.getenv("PWB_DEFAULT_TTL", "3600"))        # 1h
-MAX_TTL     = int(os.getenv("PWB_MAX_TTL", "604800"))          # 7d
-MAX_BYTES   = int(os.getenv("PWB_MAX_SECRET_BYTES", "16384"))  # 16 KiB (plaintext cap)
+DEFAULT_TTL = int(os.getenv("PWB_DEFAULT_TTL", "3600"))
+MAX_TTL     = int(os.getenv("PWB_MAX_TTL", "604800"))
+MAX_BYTES   = int(os.getenv("PWB_MAX_SECRET_BYTES", "16384"))
 SERVER_HMAC_SECRET = base64.b64decode(os.environ["SERVER_HMAC_SECRET"])
 LOG_SALT           = base64.b64decode(os.environ["LOG_SALT"])
 ADMIN_TOKEN        = os.getenv("ADMIN_TOKEN", "")
 
-# Utils
 now = lambda: int(time.time())
 def b64url_bytes(b: bytes) -> str: return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 def unb64url(s: str) -> bytes: return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 def hmac_b64(key: bytes, data: str) -> str: return b64url_bytes(hmac.new(key, data.encode(), "sha256").digest())
 def sha256_b64(s: str) -> str: return b64url_bytes(hashlib.sha256(s.encode()).digest())
+
 def client_ip(req: Request) -> str:
     xf = req.headers.get("x-forwarded-for")
     return xf.split(",")[0].strip() if xf else (req.client.host if req.client else "0.0.0.0")
 
-# DB
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
     con.row_factory = sqlite3.Row
@@ -123,22 +140,21 @@ def init_db():
     con.close()
 init_db()
 
-# Models
 class CreateIn(BaseModel):
     ciphertext: str
     nonce: str
-    ttl: Optional[int] = Field(DEFAULT_TTL, ge=60, le=MAX_TTL)
+    ttl: Optional[int] = Field(default=DEFAULT_TTL, ge=60, le=MAX_TTL)
     @field_validator("ciphertext","nonce")
     @classmethod
     def _b64(cls,v:str)->str:
         try: unb64url(v)
         except: raise ValueError("invalid base64url")
         return v
+
 class CreateOut(BaseModel): id: str; auth_token: str
 class ConsumeIn(BaseModel): id: str; token: str
 class ConsumeOut(BaseModel): ciphertext: str; nonce: str
 
-# App
 app = FastAPI(title="Password Burner", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -157,7 +173,6 @@ async def sec_headers(request: Request, call_next):
     })
     return resp
 
-# tiny in-memory rate limit: 50 req / 10s / IP
 _RL = {}; RL_WIN=10; RL_MAX=50
 def rate_limit(req: Request):
     t = now() // RL_WIN; key = (client_ip(req), t)
@@ -167,7 +182,8 @@ def rate_limit(req: Request):
 def audit(event:str, *, sid:str, ct_bytes:int|None=None, ttl:int|None=None, req:Request|None=None):
     ip = client_ip(req) if req else "0.0.0.0"
     ua = req.headers.get("user-agent","") if req else ""
-    row = ( now(), event, hmac_b64(LOG_SALT,sid), sid[:6], ct_bytes, ttl,
+    row = ( now(), event,
+            hmac_b64(LOG_SALT,sid), sid[:6], ct_bytes, ttl,
             hmac_b64(LOG_SALT,ip), sha256_b64(ua))
     c=db(); c.execute("INSERT INTO audit_events(ts,event,sid_hash,sid_prefix,ct_bytes,ttl,ip_hash,ua_hash) VALUES (?,?,?,?,?,?,?,?)", row); c.close()
 
@@ -224,20 +240,9 @@ def burn(body: ConsumeIn, request: Request):
         raise HTTPException(404, "Not found or already consumed")
     audit("burn", sid=body.id, req=request)
     return {"status":"burned"}
-
-if __name__ == "__main__":
-    # CLI helper: python app.py cleanup
-    import sys
-    if len(sys.argv)>1 and sys.argv[1]=="cleanup":
-        c=db()
-        ids=[r["id"] for r in c.execute("SELECT id FROM secrets WHERE expires_at<=?", (now(),)).fetchall()]
-        c.execute("DELETE FROM secrets WHERE expires_at<=?", (now(),))
-        c.close()
-        for sid in ids: audit("expire", sid=sid)
-        print(f"Expired {len(ids)} secrets.")
 PY
 
-# ---------- static files ----------
+# ----- static files -----
 cat > "$APP_STATIC_DIR/index.html" <<'HTML'
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -337,7 +342,7 @@ CSS
 
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
 
-echo "[5/8] Secrets & environment..."
+echo "[6/9] Secrets & environment..."
 if [[ ! -f "$ENV_FILE" ]]; then
   SERVER_HMAC_SECRET="$(openssl rand -base64 32)"
   LOG_SALT="$(openssl rand -base64 32)"
@@ -357,11 +362,12 @@ ENV
   chmod 600 "$ENV_FILE"
 fi
 
-echo "[6/8] systemd service..."
+echo "[7/9] systemd service..."
 cat > "$SYSTEMD_UNIT" <<SYSTEMD
 [Unit]
 Description=Password Burner (FastAPI)
 After=network.target
+
 [Service]
 User=$APP_USER
 Group=$APP_USER
@@ -370,13 +376,14 @@ WorkingDirectory=$APP_DIR
 ExecStart=$APP_VENV/bin/uvicorn app.app:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips="*" --access-log off
 Restart=on-failure
 RestartSec=3
+
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
 systemctl daemon-reload
 systemctl enable --now pwburner
 
-echo "[7/8] Nginx..."
+echo "[8/9] Nginx..."
 cat > "$NGINX_SITE" <<NGINX
 server {
     listen 80;
@@ -389,23 +396,22 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Real-IP \$remote_addr;
     }
-    # Certbot will insert HTTPS redirect here if DOMAIN is set
+    # Certbot will insert HTTPS redirect if --domain is used
 }
 NGINX
 ln -sf "$NGINX_SITE" "$NGINX_LINK"
 nginx -t && systemctl reload nginx
 
 if [[ -n "$DOMAIN" ]]; then
-  echo "[7b/8] Let's Encrypt (domain: $DOMAIN)..."
+  echo "[8b/9] Let's Encrypt..."
   if [[ -z "$EMAIL" ]]; then
-    echo "  No --email provided. Using --register-unsafely-without-email."
     certbot --nginx -d "$DOMAIN" --redirect --agree-tos --register-unsafely-without-email || true
   else
     certbot --nginx -d "$DOMAIN" --redirect --agree-tos -m "$EMAIL" --no-eff-email || true
   fi
 fi
 
-echo "[8/8] Firewall..."
+echo "[9/9] Firewall (ufw)..."
 ufw allow OpenSSH || true
 ufw allow 'Nginx Full' || true
 yes | ufw enable || true
@@ -418,5 +424,4 @@ else
   ip=$(hostname -I | awk '{print $1}')
   echo "Open: http://${ip}/  (Consider adding a domain + TLS later.)"
 fi
-echo
 echo "Admin audit export token is in $ENV_FILE (ADMIN_TOKEN)."
