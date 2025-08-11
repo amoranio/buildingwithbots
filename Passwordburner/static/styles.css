@@ -1,0 +1,51 @@
+html, body {
+  margin: 0;
+  font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: #111;
+  background: #fff;
+}
+
+main {
+  max-width: 720px;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+h1 {
+  margin-top: 0;
+}
+
+label {
+  display: block;
+  margin: .75rem 0 .25rem;
+  font-weight: 600;
+}
+
+textarea {
+  width: 100%;
+  min-height: 10rem;
+}
+
+input#link {
+  width: 100%;
+}
+
+button {
+  margin-top: 1rem;
+  padding: .6rem 1rem;
+  cursor: pointer;
+}
+
+.hint {
+  color: #444;
+}
+
+.error {
+  color: #a00;
+}
+
+pre {
+  background: #f6f6f6;
+  padding: 1rem;
+  overflow: auto;
+}

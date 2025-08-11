@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Password Burner — Create</title>
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <h1>One-time Secret</h1>
+    <p>Enter a secret. It’s encrypted locally; the server never sees it. You’ll get a one-time link.</p>
+    <label for="secret">Secret</label>
+    <textarea id="secret" maxlength="16000" placeholder="Paste password, token…"></textarea>
+    <label for="ttl">Expires in</label>
+    <select id="ttl">
+      <option value="600">10 minutes</option>
+      <option value="3600" selected>1 hour</option>
+      <option value="86400">24 hours</option>
+      <option value="604800">7 days</option>
+    </select>
+    <button id="createBtn">Create one-time link</button>
+    <section id="result" hidden>
+      <h2>Your link</h2>
+      <input id="link" readonly>
+      <p class="hint">Share this link once. The decryption key lives in the <code>#fragment</code> and never reaches our server.</p>
+    </section>
+    <p id="error" class="error" hidden></p>
+  </main>
+  <script src="/static/create.js" defer></script>
+</body>
+</html>
